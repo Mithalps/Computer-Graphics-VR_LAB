@@ -14,6 +14,8 @@ A collection of Computer Graphics lab experiments implemented using Python, NumP
 | 6 | Z-Buffer Algorithm | Visibility determination for overlapping surfaces using depth buffering |
 | 7 | Phong Illumination Model | Simulation of ambient, diffuse, and specular lighting on a 3D object |
 | 8 | 2D Geometric Transformations (Unity) | Interactive demonstration of translation, rotation, scaling, reflection, and shearing using transformation matrices |
+| 9 | Interactive 3D Scene (Unity) | Creation of an interactive 3D scene containing objects, lighting, and controls |
+| 10 | 3D Viewing Pipeline (Unity) | Implementation of view transformation, perspective and orthographic projection, and viewport mapping |
 
 ## Technologies Used
 
@@ -43,14 +45,16 @@ A collection of Computer Graphics lab experiments implemented using Python, NumP
 
    Replace `filename.py` with the actual Python filename in that lab folder.
 
-### Unity Lab (Lab 8)
+### Unity Labs (Labs 8–10)
 
 1. Install Unity Hub and a compatible Unity Editor version.
-2. Open Unity Hub and select **Add project from disk**.
-3. Select the `lab8` folder.
-4. Open the project and load the `Experiment8` scene.
-5. Press **Play** to run the experiment.
-6. Select a transformation, enter the required parameters, and click **Apply Transformation**.
+2. Open Unity Hub and select **Add → Add project from disk**.
+3. Select the required lab folder (`lab8`, `lab9`, or `lab10`).
+4. Open the project in Unity.
+5. Open the corresponding scene from the `Assets/Scenes/` folder, if it has been saved there.
+6. Press **Play** to run the experiment.
+
+**Note:** If a scene is created at runtime by a script, follow the instructions in that lab's README to set up the required GameObject and attach the correct script.
 
 ## Project Structure
 
@@ -63,10 +67,12 @@ Computer-Graphics-VR_LAB/
 ├── lab5/
 ├── lab6/
 ├── lab7/
-└── lab8/
+├── lab8/
+├── lab9/
+└── lab10/
 ```
 
-Each lab folder contains the implementation for its respective experiment and any required resources or generated output files.
+Each lab folder contains the implementation for its respective experiment and any required resources, scenes, scripts, or generated output files.
 
 ## Author
 
