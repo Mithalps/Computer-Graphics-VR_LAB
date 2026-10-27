@@ -1,5 +1,5 @@
 // Assets/Scripts/TransformationController.cs
-// Experiment 8 - 2D geometric transformations with a custom vertex/fragment shader.
+// Lab 8 - 2D geometric transformations with a custom vertex/fragment shader.
 //
 // Attach this single script to an EMPTY GameObject in an empty scene.
 // At runtime it:
@@ -7,12 +7,25 @@
 //   * builds the polygon mesh, grid and axes (generated vertices),
 //   * builds the whole UI (Canvas, buttons, input fields, matrix display),
 //   * builds the 3x3 matrix, sends it to the shader as three row vectors,
+//   * keeps the camera framed so the original AND transformed polygons stay visible,
 //   * prints the matrix and transformed vertices to the Console.
 //
 // Matrix convention: column vectors, p' = M * p. The matrix is sent to the shader as
 // _Row0/_Row1/_Row2 in the same row order as on paper; the shader uses mul(M, p).
 // No transpose is therefore needed anywhere.
+//
+// CHANGES vs. the previous version (see the explanation that accompanies this file):
+//   1. View: the camera used to be fixed at (0,0) with orthographic size 7, so any result
+//      outside x in [-7*aspect, 7*aspect], y in [-7, 7] was transformed correctly but drawn
+//      off-screen. The camera now re-frames (autoFitView) WITHOUT touching the maths, the
+//      grid/axes are regenerated to cover the view, and the panel reports visibility.
+//   2. Input: unparsable / empty / "-" fields no longer silently fall back to hard-coded
+//      0 or 1. Apply refuses invalid input and says which field is wrong.
+//   3. Display always shows the matrix that is actually drawn (applied state is stored).
+//   4. Geometry lives under a root at world identity, so the position/scale of the GameObject
+//      this script sits on can never shift the drawing (the shader applies the object matrix).
 
+using System.Collections.Generic;
 using System.Globalization;
 using System.Text;
 using UnityEngine;
@@ -44,11 +57,18 @@ public class TransformationController : MonoBehaviour
     public Vector2[] polygon = { new Vector2(1f, 1f), new Vector2(3f, 1f), new Vector2(1f, 2f) };
 
     [Header("View / UI")]
+    [Tooltip("Default (and minimum) half-height of the view in grid units.")]
     public float orthoSize = 7f;
+    [Tooltip("The grid always covers at least +/- this many units; it grows with the view.")]
     public int gridHalfExtent = 15;
     public float panelWidth = 380f;
     [Tooltip("If true, the transformed polygon updates on every parameter edit (no need to click Apply).")]
     public bool liveUpdate = false;
+    [Tooltip("If true, the camera pans/zooms so the origin, the blue and the red polygon are all in view. " +
+             "Only the camera changes - the matrix and coordinates are never altered.")]
+    public bool autoFitView = true;
+    [Tooltip("Minimum empty border (grid units) kept around the fitted content.")]
+    public float viewPadding = 1f;
 
     // ------------------------------------------------------------ default (example) parameters
     const float DefTx = 3f, DefTy = 2f;
@@ -56,16 +76,29 @@ public class TransformationController : MonoBehaviour
     const float DefSx = 2f, DefSy = 0.5f;
     const float DefShx = 0.8f, DefShy = 0f;
 
+    const float MaxParam = 1e6f;        // largest |parameter| accepted
+    const float MaxOrthoSize = 1e7f;    // safety cap for the camera
+    static readonly Bounds HugeBounds = new Bounds(Vector3.zero, Vector3.one * 1e8f);
+
     // ------------------------------------------------------------ runtime state
     Camera cam;
     Canvas canvas;
     Font uiFont, monoFont;
     Material origMat, transMat, gridMat, axesMat;
     MeshRenderer transformedRenderer;
+    Transform geometryRoot;
+    Mesh gridMesh, axesMesh;
+    float gridStep = 1f;
 
     TransformType selected = TransformType.Translation;
     ReflectAxis axis = ReflectAxis.XAxis;
     Status status = Status.Reset;
+
+    // What is ACTUALLY drawn by the red polygon (independent of what the fields say right now).
+    bool hasApplied;
+    Mat3 appliedMatrix = Mat3.Identity();
+    TransformType appliedType = TransformType.Translation;
+    string appliedDesc = "";
 
     InputField inTx, inTy, inAngle, inSx, inSy, inShx, inShy;
     Button[] typeButtons;
@@ -88,6 +121,7 @@ public class TransformationController : MonoBehaviour
         BuildUI();
 
         status = Status.Reset;
+        UpdateView();
         RefreshDisplay();
         LogOriginal();
     }
@@ -100,6 +134,10 @@ public class TransformationController : MonoBehaviour
         lastW = Screen.width; lastH = Screen.height;
         float px = Mathf.Min(panelWidth * canvas.scaleFactor, Screen.width - 10f);
         cam.pixelRect = new Rect(px, 0f, Screen.width - px, Screen.height);
+
+        // The aspect ratio of the viewport changed, so re-frame and refresh the visibility text.
+        UpdateView();
+        RefreshDisplay();
     }
 
     // =========================================================================================
@@ -122,6 +160,7 @@ public class TransformationController : MonoBehaviour
         cam.backgroundColor = Color.white;
         cam.nearClipPlane = 0.1f;
         cam.farClipPlane = 50f;
+        cam.cullingMask = ~0;
     }
 
     bool SetupMaterials()
@@ -162,12 +201,20 @@ public class TransformationController : MonoBehaviour
 
     void BuildScene()
     {
-        // Large bounds: the vertex shader moves vertices, so Unity's CPU frustum culling
-        // (which only knows the untransformed mesh) must never cull the polygon.
-        Mesh poly = BuildPolygonMesh();
+        // The vertex shader applies Unity's object-to-world matrix. Parent everything to a root
+        // that is NOT a child of this GameObject and sits at world identity, so the position /
+        // rotation / scale of whatever GameObject carries this script cannot offset the drawing.
+        geometryRoot = new GameObject("Lab8_Geometry").transform;
+        geometryRoot.position = Vector3.zero;
+        geometryRoot.rotation = Quaternion.identity;
+        geometryRoot.localScale = Vector3.one;
 
-        MakeMeshObject("Grid", BuildGridMesh(gridHalfExtent), gridMat);
-        MakeMeshObject("Axes", BuildAxesMesh(gridHalfExtent), axesMat);
+        Mesh poly = BuildPolygonMesh();
+        gridMesh = new Mesh { name = "GridMesh" };       // filled by RebuildGridAndAxes()
+        axesMesh = new Mesh { name = "AxesMesh" };
+
+        MakeMeshObject("Grid", gridMesh, gridMat);
+        MakeMeshObject("Axes", axesMesh, axesMat);
         MakeMeshObject("OriginalPolygon", poly, origMat);
         transformedRenderer = MakeMeshObject("TransformedPolygon", poly, transMat);
         transformedRenderer.enabled = false;     // hidden until the first Apply
@@ -190,48 +237,16 @@ public class TransformationController : MonoBehaviour
         var mesh = new Mesh { name = "PolygonMesh" };
         mesh.vertices = verts;
         mesh.triangles = tris;
-        mesh.bounds = new Bounds(Vector3.zero, Vector3.one * 1000f);
-        return mesh;
-    }
-
-    Mesh BuildGridMesh(int half)
-    {
-        var v = new System.Collections.Generic.List<Vector3>();
-        var idx = new System.Collections.Generic.List<int>();
-        for (int i = -half; i <= half; i++)
-        {
-            int b = v.Count;
-            v.Add(new Vector3(i, -half, 0)); v.Add(new Vector3(i, half, 0));      // vertical line
-            v.Add(new Vector3(-half, i, 0)); v.Add(new Vector3(half, i, 0));      // horizontal line
-            idx.Add(b); idx.Add(b + 1); idx.Add(b + 2); idx.Add(b + 3);
-        }
-        var mesh = new Mesh { name = "GridMesh" };
-        mesh.SetVertices(v);
-        mesh.SetIndices(idx, MeshTopology.Lines, 0);
-        mesh.bounds = new Bounds(Vector3.zero, Vector3.one * 1000f);
-        return mesh;
-    }
-
-    Mesh BuildAxesMesh(int half)
-    {
-        const float w = 0.04f;    // half thickness of the axis quads
-        var v = new Vector3[]
-        {
-            new Vector3(-half, -w, 0), new Vector3(half, -w, 0), new Vector3(half, w, 0), new Vector3(-half, w, 0), // X axis
-            new Vector3(-w, -half, 0), new Vector3(w, -half, 0), new Vector3(w, half, 0), new Vector3(-w, half, 0), // Y axis
-        };
-        var t = new int[] { 0, 1, 2, 0, 2, 3, 4, 5, 6, 4, 6, 7 };
-        var mesh = new Mesh { name = "AxesMesh" };
-        mesh.vertices = v;
-        mesh.triangles = t;
-        mesh.bounds = new Bounds(Vector3.zero, Vector3.one * 1000f);
+        // The vertex shader moves vertices, so Unity's CPU frustum culling (which only knows the
+        // untransformed mesh) must never cull the polygon: use enormous bounds.
+        mesh.bounds = HugeBounds;
         return mesh;
     }
 
     MeshRenderer MakeMeshObject(string name, Mesh mesh, Material mat)
     {
         var go = new GameObject(name);
-        go.transform.SetParent(transform, false);
+        go.transform.SetParent(geometryRoot, false);
         go.AddComponent<MeshFilter>().sharedMesh = mesh;
         var mr = go.AddComponent<MeshRenderer>();
         mr.sharedMaterial = mat;
@@ -241,49 +256,237 @@ public class TransformationController : MonoBehaviour
     }
 
     // =========================================================================================
-    //  Matrix construction / shader upload
+    //  View: framing the camera, grid + axes that follow the view
     // =========================================================================================
-    static float Read(InputField f, float fallback)
+    float ViewportAspect()
     {
-        float v;
-        return float.TryParse(f.text, NumberStyles.Float, CultureInfo.InvariantCulture, out v) ? v : fallback;
+        Rect r = cam.pixelRect;
+        return (r.width > 1f && r.height > 1f) ? r.width / r.height : 1f;
     }
 
-    Mat3 BuildMatrix()
+    /// The part of the grid plane (z = 0) that the camera currently shows.
+    Rect ViewRect()
     {
-        switch (selected)
+        float h = cam.orthographicSize;
+        float w = h * ViewportAspect();
+        Vector3 c = cam.transform.position;
+        return new Rect(c.x - w, c.y - h, 2f * w, 2f * h);
+    }
+
+    /// Re-frames the camera. Only the CAMERA moves/zooms; matrix, vertices and shader are untouched.
+    /// Keeps the origin, the blue polygon and (if applied) the red polygon inside the view.
+    /// If everything already fits in the default view (centre (0,0), size = orthoSize) the view is
+    /// left at that default, so ordinary parameter values look exactly as before.
+    void UpdateView()
+    {
+        float aspect = Mathf.Max(ViewportAspect(), 0.1f);
+        Vector2 centre = Vector2.zero;
+        float size = orthoSize;
+
+        if (autoFitView)
         {
-            case TransformType.Translation: return Mat3.Translation(Read(inTx, 0f), Read(inTy, 0f));
-            case TransformType.Rotation:    return Mat3.Rotation(Read(inAngle, 0f));
-            case TransformType.Scaling:     return Mat3.Scaling(Read(inSx, 1f), Read(inSy, 1f));
-            case TransformType.Reflection:
-                if (axis == ReflectAxis.XAxis) return Mat3.ReflectionX();
-                if (axis == ReflectAxis.YAxis) return Mat3.ReflectionY();
-                return Mat3.ReflectionBoth();
-            case TransformType.Shearing:    return Mat3.Shearing(Read(inShx, 0f), Read(inShy, 0f));
+            float minX = 0f, maxX = 0f, minY = 0f, maxY = 0f;       // the origin is always kept in view
+            for (int i = 0; i < polygon.Length; i++)
+            {
+                Vector2 a = polygon[i];
+                Grow(a, ref minX, ref maxX, ref minY, ref maxY);
+                if (hasApplied)
+                    Grow(appliedMatrix.TransformPoint(a), ref minX, ref maxX, ref minY, ref maxY);
+            }
+
+            float pad = Mathf.Max(viewPadding, 0.08f * Mathf.Max(maxX - minX, maxY - minY));
+            minX -= pad; maxX += pad; minY -= pad; maxY += pad;
+
+            bool fitsDefault = minX >= -orthoSize * aspect && maxX <= orthoSize * aspect
+                            && minY >= -orthoSize && maxY <= orthoSize;
+            if (!fitsDefault)
+            {
+                centre = new Vector2(0.5f * (minX + maxX), 0.5f * (minY + maxY));
+                size = Mathf.Max(orthoSize, 0.5f * (maxY - minY), 0.5f * (maxX - minX) / aspect);
+            }
         }
-        return Mat3.Identity();
+
+        size = Mathf.Min(size, MaxOrthoSize);
+        cam.orthographicSize = size;
+        cam.transform.position = new Vector3(centre.x, centre.y, -10f);
+        RebuildGridAndAxes();
     }
 
-    string DescribeParameters()
+    static void Grow(Vector2 p, ref float minX, ref float maxX, ref float minY, ref float maxY)
+    {
+        if (p.x < minX) minX = p.x;
+        if (p.x > maxX) maxX = p.x;
+        if (p.y < minY) minY = p.y;
+        if (p.y > maxY) maxY = p.y;
+    }
+
+    /// 1, 2, 5, 10, 20, 50, ... (never below 1 unit).
+    static float NiceStep(float raw)
+    {
+        if (raw <= 1f) return 1f;
+        float p = Mathf.Pow(10f, Mathf.Floor(Mathf.Log10(raw)));
+        float f = raw / p;
+        float n = f <= 1f ? 1f : f <= 2f ? 2f : f <= 5f ? 5f : 10f;
+        return n * p;
+    }
+
+    /// Regenerates the grid lines and the two axes so they always cover the visible area.
+    void RebuildGridAndAxes()
+    {
+        Rect v = ViewRect();
+        gridStep = NiceStep(Mathf.Max(v.width, v.height) / 20f);   // roughly <= 20 lines across the view
+
+        float half = Mathf.Max(0, gridHalfExtent);
+        int ix0 = Mathf.FloorToInt(Mathf.Min(v.xMin, -half) / gridStep) - 1;
+        int ix1 = Mathf.CeilToInt(Mathf.Max(v.xMax, half) / gridStep) + 1;
+        int iy0 = Mathf.FloorToInt(Mathf.Min(v.yMin, -half) / gridStep) - 1;
+        int iy1 = Mathf.CeilToInt(Mathf.Max(v.yMax, half) / gridStep) + 1;
+        float xLo = ix0 * gridStep, xHi = ix1 * gridStep;
+        float yLo = iy0 * gridStep, yHi = iy1 * gridStep;
+
+        var verts = new List<Vector3>();
+        var idx = new List<int>();
+        for (int i = ix0; i <= ix1; i++)                       // vertical lines
+        {
+            int b = verts.Count;
+            verts.Add(new Vector3(i * gridStep, yLo, 0f));
+            verts.Add(new Vector3(i * gridStep, yHi, 0f));
+            idx.Add(b); idx.Add(b + 1);
+        }
+        for (int j = iy0; j <= iy1; j++)                       // horizontal lines
+        {
+            int b = verts.Count;
+            verts.Add(new Vector3(xLo, j * gridStep, 0f));
+            verts.Add(new Vector3(xHi, j * gridStep, 0f));
+            idx.Add(b); idx.Add(b + 1);
+        }
+        gridMesh.Clear();
+        gridMesh.SetVertices(verts);
+        gridMesh.SetIndices(idx, MeshTopology.Lines, 0);
+        gridMesh.bounds = HugeBounds;
+
+        // Axes: thin quads whose thickness scales with the zoom so they stay about 2-3 pixels wide.
+        float w = 0.04f * cam.orthographicSize / Mathf.Max(orthoSize, 0.01f);
+        var av = new Vector3[]
+        {
+            new Vector3(xLo, -w, 0), new Vector3(xHi, -w, 0), new Vector3(xHi, w, 0), new Vector3(xLo, w, 0),   // X axis
+            new Vector3(-w, yLo, 0), new Vector3(w, yLo, 0), new Vector3(w, yHi, 0), new Vector3(-w, yHi, 0),   // Y axis
+        };
+        axesMesh.Clear();
+        axesMesh.vertices = av;
+        axesMesh.triangles = new int[] { 0, 1, 2, 0, 2, 3, 4, 5, 6, 4, 6, 7 };
+        axesMesh.bounds = HugeBounds;
+    }
+
+    /// 2 = all red vertices inside the view, 1 = not fully inside (may be partly visible), 0 = completely outside.
+    int RedVisibility()
+    {
+        Rect v = ViewRect();
+        int inside = 0;
+        float minX = float.MaxValue, maxX = float.MinValue, minY = float.MaxValue, maxY = float.MinValue;
+        for (int i = 0; i < polygon.Length; i++)
+        {
+            Vector2 q = appliedMatrix.TransformPoint(polygon[i]);
+            if (q.x >= v.xMin && q.x <= v.xMax && q.y >= v.yMin && q.y <= v.yMax) inside++;
+            if (q.x < minX) minX = q.x;
+            if (q.x > maxX) maxX = q.x;
+            if (q.y < minY) minY = q.y;
+            if (q.y > maxY) maxY = q.y;
+        }
+        if (inside == polygon.Length) return 2;
+        bool overlap = maxX >= v.xMin && minX <= v.xMax && maxY >= v.yMin && minY <= v.yMax;
+        return overlap ? 1 : 0;
+    }
+
+    string ViewSummary()
     {
         var ci = CultureInfo.InvariantCulture;
+        Vector3 c = cam.transform.position;
+        bool isDefault = Mathf.Approximately(cam.orthographicSize, orthoSize)
+                      && Mathf.Abs(c.x) < 1e-4f && Mathf.Abs(c.y) < 1e-4f;
+        var sb = new StringBuilder();
+        if (isDefault)
+            sb.AppendLine("View: default");
+        else
+            sb.AppendLine(string.Format(ci, "View: auto-fit, centre ({0:0.##}, {1:0.##}), half-height {2:0.##}",
+                                        c.x, c.y, cam.orthographicSize));
+        sb.Append(string.Format(ci, "Grid spacing: {0:0.##} unit(s)", gridStep));
+        if (hasApplied)
+        {
+            sb.AppendLine();
+            int vis = RedVisibility();
+            sb.Append(vis == 2 ? "Red triangle: fully inside the view"
+                    : vis == 1 ? "Red triangle: NOT fully inside the view"
+                               : "Red triangle: OUTSIDE the view (turn on autoFitView)");
+        }
+        return sb.ToString();
+    }
+
+    // =========================================================================================
+    //  Matrix construction / shader upload
+    // =========================================================================================
+    /// Reads one input field. Never substitutes a hidden default: invalid text is reported instead.
+    static bool TryRead(InputField f, string label, out float v, out string err)
+    {
+        string raw = f.text == null ? "" : f.text;
+        string s = raw.Trim().Replace(',', '.');          // accept a decimal comma as well as a point
+        if (!float.TryParse(s, NumberStyles.Float, CultureInfo.InvariantCulture, out v)
+            || float.IsNaN(v) || float.IsInfinity(v))
+        {
+            v = 0f;
+            err = "'" + label + "' is not a valid number: \"" + raw + "\"";
+            return false;
+        }
+        if (Mathf.Abs(v) > MaxParam)
+        {
+            err = "'" + label + "' is too large (limit +/-" + MaxParam.ToString("0", CultureInfo.InvariantCulture) + ")";
+            return false;
+        }
+        err = null;
+        return true;
+    }
+
+    /// Builds the matrix for the CURRENTLY SELECTED transformation from the CURRENT field values.
+    bool TryBuild(out Mat3 M, out string desc, out string err)
+    {
+        var ci = CultureInfo.InvariantCulture;
+        M = Mat3.Identity();
+        desc = "";
+        err = null;
+        float a, b;
         switch (selected)
         {
             case TransformType.Translation:
-                return string.Format(ci, "tx = {0:0.###},  ty = {1:0.###}", Read(inTx, 0f), Read(inTy, 0f));
+                if (!TryRead(inTx, "tx", out a, out err) || !TryRead(inTy, "ty", out b, out err)) return false;
+                M = Mat3.Translation(a, b);
+                desc = string.Format(ci, "tx = {0:0.###},  ty = {1:0.###}", a, b);
+                return true;
+
             case TransformType.Rotation:
-                return string.Format(ci, "theta = {0:0.###} deg (counter-clockwise)", Read(inAngle, 0f));
+                if (!TryRead(inAngle, "angle", out a, out err)) return false;
+                M = Mat3.Rotation(a);
+                desc = string.Format(ci, "theta = {0:0.###} deg (counter-clockwise)", a);
+                return true;
+
             case TransformType.Scaling:
-                return string.Format(ci, "sx = {0:0.###},  sy = {1:0.###}", Read(inSx, 1f), Read(inSy, 1f));
+                if (!TryRead(inSx, "sx", out a, out err) || !TryRead(inSy, "sy", out b, out err)) return false;
+                M = Mat3.Scaling(a, b);
+                desc = string.Format(ci, "sx = {0:0.###},  sy = {1:0.###}", a, b);
+                return true;
+
             case TransformType.Reflection:
-                return axis == ReflectAxis.XAxis ? "about the X-axis (y -> -y)"
-                     : axis == ReflectAxis.YAxis ? "about the Y-axis (x -> -x)"
-                     : "about both axes (x -> -x, y -> -y)";
+                if (axis == ReflectAxis.XAxis)      { M = Mat3.ReflectionX();    desc = "about the X-axis (y -> -y)"; }
+                else if (axis == ReflectAxis.YAxis) { M = Mat3.ReflectionY();    desc = "about the Y-axis (x -> -x)"; }
+                else                                { M = Mat3.ReflectionBoth(); desc = "about both axes (x -> -x, y -> -y)"; }
+                return true;
+
             case TransformType.Shearing:
-                return string.Format(ci, "shx = {0:0.###},  shy = {1:0.###}", Read(inShx, 0f), Read(inShy, 0f));
+                if (!TryRead(inShx, "shx", out a, out err) || !TryRead(inShy, "shy", out b, out err)) return false;
+                M = Mat3.Shearing(a, b);
+                desc = string.Format(ci, "shx = {0:0.###},  shy = {1:0.###}", a, b);
+                return true;
         }
-        return "";
+        return true;
     }
 
     /// Sends the matrix to the shader row by row (no transpose; shader uses mul(M, p)).
@@ -299,14 +502,29 @@ public class TransformationController : MonoBehaviour
     // =========================================================================================
     public void Apply()
     {
-        Mat3 M = BuildMatrix();
-        SetMatrix(transMat, M);
+        Mat3 M; string desc, err;
+        if (!TryBuild(out M, out desc, out err))
+        {
+            // Invalid input: change nothing that is drawn, and tell the user why.
+            status = Status.Preview;
+            RefreshDisplay();
+            Debug.LogWarning("Apply ignored - " + err);
+            return;
+        }
+
+        appliedMatrix = M;
+        appliedType = selected;
+        appliedDesc = desc;
+        hasApplied = true;
+
+        SetMatrix(transMat, M);                 // geometry on the GPU
         transformedRenderer.enabled = true;
         status = Status.Applied;
+        UpdateView();                           // camera only; maths untouched
         RefreshDisplay();
 
         var sb = new StringBuilder();
-        sb.AppendLine("=== Applied: " + selected + " (" + DescribeParameters() + ") ===");
+        sb.AppendLine("=== Applied: " + selected + " (" + desc + ") ===");
         sb.AppendLine("Matrix M (column-vector convention, p' = M * p):");
         sb.AppendLine(M.ToString());
         sb.AppendLine("Vertices (original -> transformed):");
@@ -315,29 +533,35 @@ public class TransformationController : MonoBehaviour
             Vector2 q = M.TransformPoint(polygon[i]);
             sb.AppendLine(string.Format(CultureInfo.InvariantCulture,
                 "  P{0}: ({1:0.000}, {2:0.000}) -> ({3:0.000}, {4:0.000})",
-                i, polygon[i].x, polygon[i].y, q.x, q.y));
+                i, polygon[i].x, polygon[i].y, Mat3.Clean(q.x), Mat3.Clean(q.y)));
         }
+        sb.AppendLine(ViewSummary());
         Debug.Log(sb.ToString());
     }
 
     public void ResetAll()
     {
+        hasApplied = false;
+        appliedMatrix = Mat3.Identity();
+        appliedDesc = "";
         SetMatrix(transMat, Mat3.Identity());
         transformedRenderer.enabled = false;
 
-        inTx.SetTextWithoutNotify(DefTx.ToString(CultureInfo.InvariantCulture));
-        inTy.SetTextWithoutNotify(DefTy.ToString(CultureInfo.InvariantCulture));
-        inAngle.SetTextWithoutNotify(DefAngle.ToString(CultureInfo.InvariantCulture));
-        inSx.SetTextWithoutNotify(DefSx.ToString(CultureInfo.InvariantCulture));
-        inSy.SetTextWithoutNotify(DefSy.ToString(CultureInfo.InvariantCulture));
-        inShx.SetTextWithoutNotify(DefShx.ToString(CultureInfo.InvariantCulture));
-        inShy.SetTextWithoutNotify(DefShy.ToString(CultureInfo.InvariantCulture));
+        var ci = CultureInfo.InvariantCulture;
+        inTx.SetTextWithoutNotify(DefTx.ToString(ci));
+        inTy.SetTextWithoutNotify(DefTy.ToString(ci));
+        inAngle.SetTextWithoutNotify(DefAngle.ToString(ci));
+        inSx.SetTextWithoutNotify(DefSx.ToString(ci));
+        inSy.SetTextWithoutNotify(DefSy.ToString(ci));
+        inShx.SetTextWithoutNotify(DefShx.ToString(ci));
+        inShy.SetTextWithoutNotify(DefShy.ToString(ci));
         axis = ReflectAxis.XAxis;
         HighlightAxisButtons();
 
         status = Status.Reset;
+        UpdateView();                           // back to the default view
         RefreshDisplay();
-        Debug.Log("=== Reset: transformed polygon hidden, matrix = identity ===");
+        Debug.Log("=== Reset: transformed polygon hidden, matrix = identity, parameters and view restored ===");
         LogOriginal();
     }
 
@@ -379,32 +603,60 @@ public class TransformationController : MonoBehaviour
     // =========================================================================================
     //  Matrix display + console helpers
     // =========================================================================================
+    static string Pt(Vector2 p)
+    {
+        return string.Format(CultureInfo.InvariantCulture, "({0:0.00}, {1:0.00})", Mat3.Clean(p.x), Mat3.Clean(p.y));
+    }
+
     void RefreshDisplay()
     {
         if (matrixText == null) return;
-        Mat3 M = (status == Status.Reset) ? Mat3.Identity() : BuildMatrix();
+        var ci = CultureInfo.InvariantCulture;
+
+        // Which matrix is shown?  Reset: identity.  Applied: exactly the one being drawn.
+        // Preview: the one the current fields WOULD produce (not drawn until Apply is pressed).
+        Mat3 M; string desc; string err = null;
+        TransformType shown = selected;
+        if (status == Status.Reset) { M = Mat3.Identity(); desc = "-"; }
+        else if (status == Status.Applied) { M = appliedMatrix; desc = appliedDesc; shown = appliedType; }
+        else if (!TryBuild(out M, out desc, out err)) { M = null; }
 
         var sb = new StringBuilder();
-        sb.AppendLine("Transformation: " + selected);
-        sb.AppendLine("Parameters: " + (status == Status.Reset ? "-" : DescribeParameters()));
+        sb.AppendLine("Transformation: " + shown);
+
+        if (M == null)
+        {
+            sb.AppendLine("Parameters: INVALID");
+            sb.AppendLine();
+            sb.AppendLine(err);
+            sb.AppendLine("Nothing is applied until every field holds a valid number.");
+            sb.AppendLine();
+            sb.AppendLine("Status: invalid input");
+            if (hasApplied) sb.AppendLine("(red triangle still shows: " + appliedType + ", " + appliedDesc + ")");
+            sb.Append(ViewSummary());
+            matrixText.text = sb.ToString();
+            return;
+        }
+
+        sb.AppendLine("Parameters: " + desc);
         sb.AppendLine();
         sb.AppendLine("M =");
         sb.AppendLine(M.RowString(0));
         sb.AppendLine(M.RowString(1));
         sb.AppendLine(M.RowString(2));
-        sb.AppendLine();
+        float det = M.Determinant();
+        sb.AppendLine(string.Format(ci, "det(M) = {0:0.###}{1}", Mat3.Clean(det),
+            Mathf.Abs(det) < 1e-6f ? "  (singular: shape collapses)" : det < 0f ? "  (orientation flipped)" : ""));
         sb.AppendLine("p' = M * [x y 1]^T");
         for (int i = 0; i < polygon.Length; i++)
-        {
-            Vector2 q = M.TransformPoint(polygon[i]);
-            sb.AppendLine(string.Format(CultureInfo.InvariantCulture,
-                "P{0}: ({1:0.00}, {2:0.00}) -> ({3:0.00}, {4:0.00})",
-                i, polygon[i].x, polygon[i].y, q.x, q.y));
-        }
+            sb.AppendLine("P" + i + ": " + Pt(polygon[i]) + " -> " + Pt(M.TransformPoint(polygon[i])));
         sb.AppendLine();
-        sb.Append(status == Status.Applied ? "Status: APPLIED"
-                : status == Status.Preview ? "Status: preview - press Apply"
-                : "Status: RESET (identity, original only)");
+        sb.AppendLine(status == Status.Applied ? "Status: APPLIED"
+                    : status == Status.Preview ? "Status: preview - press Apply"
+                    : "Status: RESET (identity, original only)");
+        if (status == Status.Preview && hasApplied)
+            sb.AppendLine("(red triangle still shows: " + appliedType + ", " + appliedDesc + ")");
+        sb.Append(ViewSummary());
         matrixText.text = sb.ToString();
     }
 

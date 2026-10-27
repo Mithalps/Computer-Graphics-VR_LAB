@@ -32,8 +32,8 @@ public sealed class Mat3
     public static Mat3 Rotation(float degrees)
     {
         float t = degrees * Mathf.Deg2Rad;
-        float c = Mathf.Cos(t);
-        float s = Mathf.Sin(t);
+        float c = Snap(Mathf.Cos(t));
+        float s = Snap(Mathf.Sin(t));
         var r = Identity();
         r.m[0, 0] = c;  r.m[0, 1] = -s;
         r.m[1, 0] = s;  r.m[1, 1] = c;
@@ -105,6 +105,15 @@ public sealed class Mat3
         return new Vector2(x / w, y / w);
     }
 
+    /// Determinant of the full 3x3 matrix. For an affine 2D transform this equals the area scale factor:
+    /// |det| = area ratio, det < 0 means orientation is flipped, det = 0 means the shape collapses.
+    public float Determinant()
+    {
+        return m[0, 0] * (m[1, 1] * m[2, 2] - m[1, 2] * m[2, 1])
+             - m[0, 1] * (m[1, 0] * m[2, 2] - m[1, 2] * m[2, 0])
+             + m[0, 2] * (m[1, 0] * m[2, 1] - m[1, 1] * m[2, 0]);
+    }
+
     /// Row i as a Vector4 (x, y, z = matrix entries, w unused) - this is what the shader receives.
     public Vector4 Row(int i)
     {
@@ -112,9 +121,16 @@ public sealed class Mat3
     }
 
     // ----------------------------------------------------------------- display
-    static float Clean(float v)
+    /// Display helper: tiny values (and negative zero) become exactly 0, so "-0.000" is never printed.
+    public static float Clean(float v)
     {
-        return Mathf.Abs(v) < 0.0005f ? 0f : v;   // avoids printing "-0.000"
+        return Mathf.Abs(v) < 0.0005f ? 0f : v;
+    }
+
+    /// Float noise such as cos(90 deg) = -4.4e-8 becomes an exact 0 in the rotation matrix.
+    static float Snap(float v)
+    {
+        return Mathf.Abs(v) < 1e-6f ? 0f : v;
     }
 
     public string RowString(int i)
